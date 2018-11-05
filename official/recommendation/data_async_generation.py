@@ -185,8 +185,9 @@ def init_worker():
   signal.signal(signal.SIGINT, sigint_handler)
 
 
-def write_record_files(is_training, data, batch_size, num_pts,
-                       num_pts_with_padding, num_readers, cache_paths, train_cycle, st, num_neg, dupe_mask):
+def write_record_files(
+    is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers,
+    cache_paths, train_cycle, st, dupe_mask):
   if is_training:
     # The number of points is slightly larger than num_pts due to padding.
     mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_SIZE,
@@ -421,14 +422,14 @@ def _construct_records(
       sharded_items = [items_by_user[shard_indices[i]:shard_indices[i+1], :] for i in range(num_workers)]
       dupe_generator = pool.starmap(stat_utils.mask_duplicates, [(sharded_items[i], 1) for i in range(num_workers)])
 
-      dupe_mask = np.concatenate([i.flatten().astype(np.int8) for i in dupe_generator])
+      dupe_mask = np.concatenate([i.astype(np.int8) for i in dupe_generator]).flatten()
 
-  log_msg("Data generation complete. (time: {:.1f} seconds) Beginning async I/O"
+  log_msg("Data generation complete. (time: {:.1f} seconds) Beginning file write."
           .format(timeit.default_timer() - st))
 
-  io_pool.apply_async(func=write_record_files, args=(
-    is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers,
-    cache_paths, train_cycle, st, num_neg, dupe_mask))
+  write_record_files(
+      is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers,
+      cache_paths, train_cycle, st, dupe_mask)
 
 def _generation_loop(num_workers,           # type: int
                      cache_paths,           # type: rconst.Paths
