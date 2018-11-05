@@ -242,7 +242,7 @@ def write_record_files(
 
   def _write_records(fpath, batches_for_current_file, data, dupe_mask):
     log_msg("Writing {}".format(fpath))
-    with tf.python_io.TFRecordWriter(fpath) as writer:
+    with tf.python_io.TFRecordWriter(fpath, options=tf.python_io.TFRecordOptions(python_io.TFRecordCompressionType.GZIP)) as writer:
       for j in batches_for_current_file:
         start_ind = j * batch_size
         end_ind = start_ind + batch_size
@@ -298,6 +298,7 @@ def write_record_files(
   # We write to a temp file then atomically rename it to the final file, because
   # writing directly to the final file can cause the main process to read a
   # partially written JSON file.
+  log_msg("Preparing ready file.")
   ready_file_temp = os.path.join(record_dir, rconst.READY_FILE_TEMP)
   with tf.gfile.Open(ready_file_temp, "w") as f:
     json.dump({
@@ -391,6 +392,7 @@ def _construct_records(
       (shard, num_items, num_neg, process_seeds[i], is_training, match_mlperf)
       for i, shard in enumerate(training_shards * epochs_per_cycle)]
 
+  log_msg("Entering pool...")
   with popen_helper.get_pool(num_workers, init_worker) as pool:
     map_fn = pool.imap if deterministic else pool.imap_unordered  # pylint: disable=no-member
     data_generator = map_fn(_process_shard, map_args)
@@ -419,6 +421,7 @@ def _construct_records(
 
     assert np.sum(data[0] == -1) == num_padding
 
+    log_msg("Shuffling data...")
     if is_training:
       if num_padding:
         # In order to have a full batch, randomly include points from earlier in
@@ -442,6 +445,7 @@ def _construct_records(
     if is_training:
       dupe_mask = None
     else:
+      log_msg("Generating duplicate mask...")
       items_by_user = data[1].reshape(-1, num_neg + 1)
       shard_indices = np.linspace(0, items_by_user.shape[0], num_workers + 1).astype("int")
       sharded_items = [items_by_user[shard_indices[i]:shard_indices[i+1], :] for i in range(num_workers)]
