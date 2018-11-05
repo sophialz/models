@@ -186,7 +186,7 @@ def init_worker():
 
 
 def write_record_files(is_training, data, batch_size, num_pts,
-                       num_pts_with_padding, num_readers, cache_paths):
+                       num_pts_with_padding, num_readers, cache_paths, train_cycle, st):
   if is_training:
     # The number of points is slightly larger than num_pts due to padding.
     mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_SIZE,
@@ -293,6 +293,7 @@ def _construct_records(
     epochs_per_cycle,     # type: int
     batch_size,           # type: int
     training_shards,      # type: typing.List[str]
+    io_pool,              # type: multiprocessing.Pool
     deterministic=False,  # type: bool
     match_mlperf=False    # type: bool
     ):
@@ -405,12 +406,15 @@ def _construct_records(
   # Check that no points were overlooked.
   assert not np.sum(data[0] == -1)
 
-  write_data = threading.Thread(target=write_record_files, args=(
-    is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers, cache_paths))
-  write_data.start()
+  # write_data = threading.Thread(target=write_record_files, args=(
+  #   is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers, cache_paths, train_cycle, st))
+  # write_data.start()
+
+  io_pool.apply_async(func=write_record_files, args=(
+    is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers, cache_paths, train_cycle, st))
 
   # write_record_files(is_training, data, batch_size, num_pts,
-  #                    num_pts_with_padding, num_readers)
+  #                    num_pts_with_padding, num_readers, cache_paths, train_cycle, st)
 
 
 
@@ -428,7 +432,8 @@ def _generation_loop(num_workers,           # type: int
                      train_batch_size,      # type: int
                      eval_batch_size,       # type: int
                      deterministic,         # type: bool
-                     match_mlperf           # type: bool
+                     match_mlperf,          # type: bool
+                     io_pool                # type: multiprocessing.Pool
                     ):
   # type: (...) -> None
   """Primary run loop for data file generation."""
@@ -444,7 +449,7 @@ def _generation_loop(num_workers,           # type: int
       num_workers=multiprocessing.cpu_count(), cache_paths=cache_paths,
       num_readers=num_readers, num_items=num_items,
       training_shards=training_shards, deterministic=deterministic,
-      match_mlperf=match_mlperf
+      match_mlperf=match_mlperf, io_pool=io_pool
   )
 
   # Training blocks on the creation of the first epoch, so the num_workers
@@ -574,21 +579,23 @@ def main(_):
     with mlperf_helper.LOGGER(
         enable=flags.FLAGS.output_ml_perf_compliance_logging):
       mlperf_helper.set_ncf_root(os.path.split(os.path.abspath(__file__))[0])
-      _generation_loop(
-          num_workers=flags.FLAGS.num_workers,
-          cache_paths=cache_paths,
-          num_readers=flags.FLAGS.num_readers,
-          num_neg=flags.FLAGS.num_neg,
-          num_train_positives=flags.FLAGS.num_train_positives,
-          num_items=flags.FLAGS.num_items,
-          num_users=flags.FLAGS.num_users,
-          epochs_per_cycle=flags.FLAGS.epochs_per_cycle,
-          num_cycles=flags.FLAGS.num_cycles,
-          train_batch_size=flags.FLAGS.train_batch_size,
-          eval_batch_size=flags.FLAGS.eval_batch_size,
-          deterministic=flags.FLAGS.seed is not None,
-          match_mlperf=flags.FLAGS.ml_perf,
-      )
+      with popen_helper.get_pool(2, init_worker) as io_pool:
+        _generation_loop(
+            num_workers=flags.FLAGS.num_workers,
+            cache_paths=cache_paths,
+            num_readers=flags.FLAGS.num_readers,
+            num_neg=flags.FLAGS.num_neg,
+            num_train_positives=flags.FLAGS.num_train_positives,
+            num_items=flags.FLAGS.num_items,
+            num_users=flags.FLAGS.num_users,
+            epochs_per_cycle=flags.FLAGS.epochs_per_cycle,
+            num_cycles=flags.FLAGS.num_cycles,
+            train_batch_size=flags.FLAGS.train_batch_size,
+            eval_batch_size=flags.FLAGS.eval_batch_size,
+            deterministic=flags.FLAGS.seed is not None,
+            match_mlperf=flags.FLAGS.ml_perf,
+            io_pool=io_pool
+        )
   except KeyboardInterrupt:
     log_msg("KeyboardInterrupt registered.")
   except:
