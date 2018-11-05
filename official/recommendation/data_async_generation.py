@@ -189,6 +189,7 @@ def init_worker():
 def write_record_files(
     is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers,
     cache_paths, train_cycle, st, dupe_mask):
+  log("Beginning shard write function...")
   if is_training:
     # The number of points is slightly larger than num_pts due to padding.
     mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_SIZE,
@@ -305,6 +306,7 @@ def _construct_records(
     epochs_per_cycle,     # type: int
     batch_size,           # type: int
     training_shards,      # type: typing.List[str]
+    pool,                 # type: multiprocessing.Pool
     deterministic=False,  # type: bool
     match_mlperf=False    # type: bool
     ):
@@ -370,72 +372,76 @@ def _construct_records(
       for i, shard in enumerate(training_shards * epochs_per_cycle)]
 
   log_msg("Entering pool...")
-  with popen_helper.get_pool(num_workers, init_worker) as pool:
-    map_fn = pool.imap if deterministic else pool.imap_unordered  # pylint: disable=no-member
-    data_generator = map_fn(_process_shard, map_args)
-    data = [
-        np.zeros(shape=(num_pts_with_padding,), dtype=np.int32) - 1,
-        np.zeros(shape=(num_pts_with_padding,), dtype=np.uint16),
-        np.zeros(shape=(num_pts_with_padding,), dtype=np.int8),
-    ]
 
-    # Training data is shuffled. Evaluation data MUST not be shuffled.
-    # Downstream processing depends on the fact that evaluation data for a given
-    # user is grouped within a batch.
-    if is_training:
-      index_destinations = np.random.permutation(num_pts)
+  map_fn = pool.imap if deterministic else pool.imap_unordered  # pylint: disable=no-member
+  data_generator = map_fn(_process_shard, map_args)
+  data = [
+      np.zeros(shape=(num_pts_with_padding,), dtype=np.int32) - 1,
+      np.zeros(shape=(num_pts_with_padding,), dtype=np.uint16),
+      np.zeros(shape=(num_pts_with_padding,), dtype=np.int8),
+  ]
+
+  # Training data is shuffled. Evaluation data MUST not be shuffled.
+  # Downstream processing depends on the fact that evaluation data for a given
+  # user is grouped within a batch.
+  if is_training:
+    index_destinations = np.random.permutation(num_pts)
+    mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_ORDER)
+  else:
+    index_destinations = np.arange(num_pts)
+
+  start_ind = 0
+  for data_segment in data_generator:
+    n_in_segment = data_segment[0].shape[0]
+    dest = index_destinations[start_ind:start_ind + n_in_segment]
+    start_ind += n_in_segment
+    for i in range(3):
+      data[i][dest] = data_segment[i]
+
+  assert np.sum(data[0] == -1) == num_padding
+
+  log_msg("Shuffling data...")
+  if is_training:
+    if num_padding:
+      # In order to have a full batch, randomly include points from earlier in
+      # the batch.
+
       mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_ORDER)
-    else:
-      index_destinations = np.arange(num_pts)
-
-    start_ind = 0
-    for data_segment in data_generator:
-      n_in_segment = data_segment[0].shape[0]
-      dest = index_destinations[start_ind:start_ind + n_in_segment]
-      start_ind += n_in_segment
+      pad_sample_indices = np.random.randint(
+          low=0, high=num_pts, size=(num_padding,))
+      dest = np.arange(start=start_ind, stop=start_ind + num_padding)
+      start_ind += num_padding
       for i in range(3):
-        data[i][dest] = data_segment[i]
+        data[i][dest] = data[i][pad_sample_indices]
+  else:
+    # For Evaluation, padding is all zeros. The evaluation input_fn knows how
+    # to interpret and discard the zero padded entries.
+    data[0][num_pts:] = 0
 
-    assert np.sum(data[0] == -1) == num_padding
+  # Check that no points were overlooked.
+  assert not np.sum(data[0] == -1)
 
-    log_msg("Shuffling data...")
-    if is_training:
-      if num_padding:
-        # In order to have a full batch, randomly include points from earlier in
-        # the batch.
+  if is_training:
+    dupe_mask = None
+  else:
+    log_msg("Generating duplicate mask...")
+    items_by_user = data[1].reshape(-1, num_neg + 1)
+    shard_indices = np.linspace(0, items_by_user.shape[0], num_workers + 1).astype("int")
+    sharded_items = [items_by_user[shard_indices[i]:shard_indices[i+1], :] for i in range(num_workers)]
+    dupe_generator = pool.starmap(stat_utils.mask_duplicates, [(sharded_items[i], 1) for i in range(num_workers)])
 
-        mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_ORDER)
-        pad_sample_indices = np.random.randint(
-            low=0, high=num_pts, size=(num_padding,))
-        dest = np.arange(start=start_ind, stop=start_ind + num_padding)
-        start_ind += num_padding
-        for i in range(3):
-          data[i][dest] = data[i][pad_sample_indices]
-    else:
-      # For Evaluation, padding is all zeros. The evaluation input_fn knows how
-      # to interpret and discard the zero padded entries.
-      data[0][num_pts:] = 0
-
-    # Check that no points were overlooked.
-    assert not np.sum(data[0] == -1)
-
-    if is_training:
-      dupe_mask = None
-    else:
-      log_msg("Generating duplicate mask...")
-      items_by_user = data[1].reshape(-1, num_neg + 1)
-      shard_indices = np.linspace(0, items_by_user.shape[0], num_workers + 1).astype("int")
-      sharded_items = [items_by_user[shard_indices[i]:shard_indices[i+1], :] for i in range(num_workers)]
-      dupe_generator = pool.starmap(stat_utils.mask_duplicates, [(sharded_items[i], 1) for i in range(num_workers)])
-
-      dupe_mask = np.concatenate([i.astype(np.int8) for i in dupe_generator]).flatten()
+    dupe_mask = np.concatenate([i.astype(np.int8) for i in dupe_generator]).flatten()
 
   log_msg("Data generation complete. (time: {:.1f} seconds) Beginning file write."
           .format(timeit.default_timer() - st))
 
-  write_record_files(
-      is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers,
-      cache_paths, train_cycle, st, dupe_mask)
+  pool.apply_async(func=write_record_files, args=(
+    is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers,
+    cache_paths, train_cycle, st, dupe_mask))
+
+  # write_record_files(
+  #     is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers,
+  #     cache_paths, train_cycle, st, dupe_mask)
 
 def _generation_loop(num_workers,           # type: int
                      cache_paths,           # type: rconst.Paths
@@ -449,7 +455,8 @@ def _generation_loop(num_workers,           # type: int
                      train_batch_size,      # type: int
                      eval_batch_size,       # type: int
                      deterministic,         # type: bool
-                     match_mlperf           # type: bool
+                     match_mlperf,          # type: bool
+                     pool                   # type: multiprocessing.Pool
                     ):
   # type: (...) -> None
   """Primary run loop for data file generation."""
@@ -465,7 +472,7 @@ def _generation_loop(num_workers,           # type: int
       num_workers=multiprocessing.cpu_count(), cache_paths=cache_paths,
       num_readers=num_readers, num_items=num_items,
       training_shards=training_shards, deterministic=deterministic,
-      match_mlperf=match_mlperf
+      match_mlperf=match_mlperf, pool=pool
   )
 
   # Training blocks on the creation of the first epoch, so the num_workers
@@ -595,21 +602,23 @@ def main(_):
     with mlperf_helper.LOGGER(
         enable=flags.FLAGS.output_ml_perf_compliance_logging):
       mlperf_helper.set_ncf_root(os.path.split(os.path.abspath(__file__))[0])
-      _generation_loop(
-          num_workers=flags.FLAGS.num_workers,
-          cache_paths=cache_paths,
-          num_readers=flags.FLAGS.num_readers,
-          num_neg=flags.FLAGS.num_neg,
-          num_train_positives=flags.FLAGS.num_train_positives,
-          num_items=flags.FLAGS.num_items,
-          num_users=flags.FLAGS.num_users,
-          epochs_per_cycle=flags.FLAGS.epochs_per_cycle,
-          num_cycles=flags.FLAGS.num_cycles,
-          train_batch_size=flags.FLAGS.train_batch_size,
-          eval_batch_size=flags.FLAGS.eval_batch_size,
-          deterministic=flags.FLAGS.seed is not None,
-          match_mlperf=flags.FLAGS.ml_perf
-      )
+      with popen_helper.get_pool(num_workers, init_worker) as pool:
+        _generation_loop(
+            num_workers=flags.FLAGS.num_workers,
+            cache_paths=cache_paths,
+            num_readers=flags.FLAGS.num_readers,
+            num_neg=flags.FLAGS.num_neg,
+            num_train_positives=flags.FLAGS.num_train_positives,
+            num_items=flags.FLAGS.num_items,
+            num_users=flags.FLAGS.num_users,
+            epochs_per_cycle=flags.FLAGS.epochs_per_cycle,
+            num_cycles=flags.FLAGS.num_cycles,
+            train_batch_size=flags.FLAGS.train_batch_size,
+            eval_batch_size=flags.FLAGS.eval_batch_size,
+            deterministic=flags.FLAGS.seed is not None,
+            match_mlperf=flags.FLAGS.ml_perf,
+            pool=pool
+        )
   except KeyboardInterrupt:
     log_msg("KeyboardInterrupt registered.")
   except:
