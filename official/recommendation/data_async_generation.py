@@ -242,7 +242,7 @@ def write_record_files(
 
   def _write_records(fpath, batches_for_current_file, data, dupe_mask):
     log_msg("Writing {}".format(fpath))
-    with tf.python_io.TFRecordWriter(fpath, options=tf.python_io.TFRecordOptions(python_io.TFRecordCompressionType.GZIP)) as writer:
+    with tf.python_io.TFRecordWriter(fpath, options=tf.python_io.TFRecordOptions(tf.python_io.TFRecordCompressionType.GZIP)) as writer:
       for j in batches_for_current_file:
         start_ind = j * batch_size
         end_ind = start_ind + batch_size
