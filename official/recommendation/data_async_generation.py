@@ -186,12 +186,8 @@ def init_worker():
   signal.signal(signal.SIGINT, sigint_handler)
 
 
-def write_record_files(is_training, data_file, batch_size, num_pts,
-                       num_pts_with_padding, num_readers, cache_paths, train_cycle, st):
-  with open(data_file, "rb") as f:
-    data = pickle.load(f)
-  tf.gfile.Remove(data_file)
-  
+def write_record_files(is_training, data, batch_size, num_pts,
+                       num_pts_with_padding, num_readers, cache_paths, train_cycle, st, num_neg):
   if is_training:
     # The number of points is slightly larger than num_pts due to padding.
     mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_SIZE,
@@ -415,12 +411,8 @@ def _construct_records(
   #   is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers, cache_paths, train_cycle, st))
   # write_data.start()
 
-  data_file = os.path.join("/tmp", "ncf_" + str(uuid.uuid4()) + ".pickle")
-  with open(data_file, "wb") as f:
-    pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-
   io_pool.apply_async(func=write_record_files, args=(
-    is_training, data_file, batch_size, num_pts, num_pts_with_padding, num_readers, cache_paths, train_cycle, st))
+    is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers, cache_paths, train_cycle, st, num_neg))
 
   # write_record_files(is_training, data, batch_size, num_pts,
   #                    num_pts_with_padding, num_readers, cache_paths, train_cycle, st)
