@@ -29,7 +29,6 @@ import pickle
 import signal
 import sys
 import tempfile
-import threading
 import time
 import timeit
 import traceback
@@ -237,6 +236,15 @@ def write_record_files(is_training, data, batch_size, num_pts,
     template = rconst.EVAL_RECORD_TEMPLATE
     record_dir = cache_paths.eval_data_subdir
 
+  # compute mask over the entire eval set to allow NumPy to parallelize
+  if not is_training:
+    # Compute duplicates over the items for a given user during evaluation.
+    dupe_mask = stat_utils.mask_duplicates(
+        data[1].reshape(-1, num_neg + 1),
+        axis=1).flatten().astype(np.int8)
+
+  log_msg("Begin writing records.")
+
   batch_count = 0
   for i in range(num_readers):
     fpath = os.path.join(record_dir, template.format(i))
@@ -253,9 +261,7 @@ def write_record_files(is_training, data, batch_size, num_pts,
         if is_training:
           record_kwargs["labels"] = data[2][start_ind:end_ind]
         else:
-          record_kwargs["dupe_mask"] = stat_utils.mask_duplicates(
-            record_kwargs["items"].reshape(-1, num_neg + 1),
-            axis=1).flatten().astype(np.int8)
+          record_kwargs["dupe_mask"] = dupe_mask[start_ind:end_ind]
 
         batch_bytes = _construct_record(**record_kwargs)
 
@@ -407,19 +413,12 @@ def _construct_records(
   # Check that no points were overlooked.
   assert not np.sum(data[0] == -1)
 
-  # write_data = threading.Thread(target=write_record_files, args=(
-  #   is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers, cache_paths, train_cycle, st))
-  # write_data.start()
+  log_msg("Data generation complete. (time: {:.1f} seconds) Beginning async I/O"
+          .format(timeit.default_timer() - st))
 
   io_pool.apply_async(func=write_record_files, args=(
-    is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers, cache_paths, train_cycle, st, num_neg))
-
-  # write_record_files(is_training, data, batch_size, num_pts,
-  #                    num_pts_with_padding, num_readers, cache_paths, train_cycle, st)
-
-
-
-
+    is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers,
+    cache_paths, train_cycle, st, num_neg))
 
 def _generation_loop(num_workers,           # type: int
                      cache_paths,           # type: rconst.Paths
