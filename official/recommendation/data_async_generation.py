@@ -186,7 +186,7 @@ def init_worker():
 
 
 def write_record_files(is_training, data, batch_size, num_pts,
-                       num_pts_with_padding, num_readers, cache_paths, train_cycle, st, num_neg):
+                       num_pts_with_padding, num_readers, cache_paths, train_cycle, st, num_neg, dupe_mask):
   if is_training:
     # The number of points is slightly larger than num_pts due to padding.
     mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_SIZE,
@@ -236,12 +236,12 @@ def write_record_files(is_training, data, batch_size, num_pts,
     template = rconst.EVAL_RECORD_TEMPLATE
     record_dir = cache_paths.eval_data_subdir
 
-  # compute mask over the entire eval set to allow NumPy to parallelize
-  if not is_training:
-    # Compute duplicates over the items for a given user during evaluation.
-    dupe_mask = stat_utils.mask_duplicates(
-        data[1].reshape(-1, num_neg + 1),
-        axis=1).flatten().astype(np.int8)
+  # # compute mask over the entire eval set to allow NumPy to parallelize
+  # if not is_training:
+  #   # Compute duplicates over the items for a given user during evaluation.
+  #   dupe_mask = stat_utils.mask_duplicates(
+  #       data[1].reshape(-1, num_neg + 1),
+  #       axis=1).flatten().astype(np.int8)
 
   log_msg("Begin writing records.")
 
@@ -391,34 +391,43 @@ def _construct_records(
       for i in range(3):
         data[i][dest] = data_segment[i]
 
-  assert np.sum(data[0] == -1) == num_padding
+    assert np.sum(data[0] == -1) == num_padding
 
-  if is_training:
-    if num_padding:
-      # In order to have a full batch, randomly include points from earlier in
-      # the batch.
+    if is_training:
+      if num_padding:
+        # In order to have a full batch, randomly include points from earlier in
+        # the batch.
 
-      mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_ORDER)
-      pad_sample_indices = np.random.randint(
-          low=0, high=num_pts, size=(num_padding,))
-      dest = np.arange(start=start_ind, stop=start_ind + num_padding)
-      start_ind += num_padding
-      for i in range(3):
-        data[i][dest] = data[i][pad_sample_indices]
-  else:
-    # For Evaluation, padding is all zeros. The evaluation input_fn knows how
-    # to interpret and discard the zero padded entries.
-    data[0][num_pts:] = 0
+        mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_ORDER)
+        pad_sample_indices = np.random.randint(
+            low=0, high=num_pts, size=(num_padding,))
+        dest = np.arange(start=start_ind, stop=start_ind + num_padding)
+        start_ind += num_padding
+        for i in range(3):
+          data[i][dest] = data[i][pad_sample_indices]
+    else:
+      # For Evaluation, padding is all zeros. The evaluation input_fn knows how
+      # to interpret and discard the zero padded entries.
+      data[0][num_pts:] = 0
 
-  # Check that no points were overlooked.
-  assert not np.sum(data[0] == -1)
+    # Check that no points were overlooked.
+    assert not np.sum(data[0] == -1)
+
+    if is_training:
+      dupe_mask = None
+    else:
+      items_by_user = data[1].reshape(-1, num_neg + 1)
+      shard_indices = np.linspace(0, items_by_user.shape[0], num_workers + 1).astype("int")
+      sharded_items = [items_by_user[shard_indices[i]:shard_indices[i+1], :] for i in range(num_workers)]
+      dupe_generator = pool.imap(stat_utils.mask_duplicates, [(sharded_items[i], 1) for i in range(num_workers)])
+      dupe_mask = np.concatenate([i.flatten().astype(np.int8) for i in dupe_generator])
 
   log_msg("Data generation complete. (time: {:.1f} seconds) Beginning async I/O"
           .format(timeit.default_timer() - st))
 
   io_pool.apply_async(func=write_record_files, args=(
     is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers,
-    cache_paths, train_cycle, st, num_neg))
+    cache_paths, train_cycle, st, num_neg, dupe_mask))
 
 def _generation_loop(num_workers,           # type: int
                      cache_paths,           # type: rconst.Paths
