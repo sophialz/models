@@ -238,17 +238,22 @@ def write_record_files(
     template = rconst.EVAL_RECORD_TEMPLATE
     record_dir = cache_paths.eval_data_subdir
 
+  temp_dir = None
+  if record_dir.startswith("gs://"):
+    temp_dir = tempfile.mkdtemp()
+
   log_msg("Begin writing records.")
 
-  def _write_records(fpath, batches_for_current_file, data, dupe_mask):
+  for i in range(num_readers):
+    fpath = os.path.join(temp_dir if temp_dir else record_dir, template.format(i))
     log_msg("Writing {}".format(fpath))
-    with tf.python_io.TFRecordWriter(fpath, options=tf.python_io.TFRecordOptions(tf.python_io.TFRecordCompressionType.GZIP)) as writer:
-      for j in batches_for_current_file:
+    with tf.python_io.TFRecordWriter(fpath) as writer:
+      for j in batches_by_file[i]:
         start_ind = j * batch_size
         end_ind = start_ind + batch_size
         record_kwargs = dict(
-            users=data[0][start_ind:end_ind],
-            items=data[1][start_ind:end_ind],
+          users=data[0][start_ind:end_ind],
+          items=data[1][start_ind:end_ind],
         )
 
         if is_training:
@@ -260,38 +265,10 @@ def write_record_files(
 
         writer.write(batch_bytes)
 
-  write_threads = []
-  for i in range(num_readers):
-    fpath = os.path.join(record_dir, template.format(i))
-    write_proc = threading.Thread(target=_write_records, args=(
-      fpath, batches_by_file[i], data, dupe_mask))
-
-    write_proc.daemon = True
-    write_proc.start()
-    write_threads.append(write_proc)
-
-    # fpath = os.path.join(record_dir, template.format(i))
-    # log_msg("Writing {}".format(fpath))
-    # with tf.python_io.TFRecordWriter(fpath) as writer:
-    #   for j in batches_by_file[i]:
-    #     start_ind = j * batch_size
-    #     end_ind = start_ind + batch_size
-    #     record_kwargs = dict(
-    #       users=data[0][start_ind:end_ind],
-    #       items=data[1][start_ind:end_ind],
-    #     )
-    #
-    #     if is_training:
-    #       record_kwargs["labels"] = data[2][start_ind:end_ind]
-    #     else:
-    #       record_kwargs["dupe_mask"] = dupe_mask[start_ind:end_ind]
-    #
-    #     batch_bytes = _construct_record(**record_kwargs)
-    #
-    #     writer.write(batch_bytes)
-
-  [i.join() for i in write_threads]
-
+  if temp_dir:
+    for i in tf.gfile.ListDirectory(temp_dir):
+      tf.gfile.Copy(os.path.join(temp_dir, i), os.path.join(record_dir, i))
+    tf.gfile.DeleteRecursively(temp_dir)
 
   batch_count = sum([len(i) for i in batches_by_file])
 
