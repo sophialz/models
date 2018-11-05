@@ -186,7 +186,7 @@ def init_worker():
 
 
 def write_record_files(is_training, data, batch_size, num_pts,
-                       num_pts_with_padding, num_readers):
+                       num_pts_with_padding, num_readers, cache_paths):
   if is_training:
     # The number of points is slightly larger than num_pts due to padding.
     mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_SIZE,
@@ -406,7 +406,7 @@ def _construct_records(
   assert not np.sum(data[0] == -1)
 
   write_data = threading.Thread(target=write_record_files, args=(
-    is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers))
+    is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers, cache_paths))
   write_data.start()
 
   # write_record_files(is_training, data, batch_size, num_pts,
