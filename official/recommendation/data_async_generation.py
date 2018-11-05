@@ -237,13 +237,6 @@ def write_record_files(
     template = rconst.EVAL_RECORD_TEMPLATE
     record_dir = cache_paths.eval_data_subdir
 
-  # # compute mask over the entire eval set to allow NumPy to parallelize
-  # if not is_training:
-  #   # Compute duplicates over the items for a given user during evaluation.
-  #   dupe_mask = stat_utils.mask_duplicates(
-  #       data[1].reshape(-1, num_neg + 1),
-  #       axis=1).flatten().astype(np.int8)
-
   log_msg("Begin writing records.")
 
   batch_count = 0
@@ -301,7 +294,6 @@ def _construct_records(
     epochs_per_cycle,     # type: int
     batch_size,           # type: int
     training_shards,      # type: typing.List[str]
-    io_pool,              # type: multiprocessing.Pool
     deterministic=False,  # type: bool
     match_mlperf=False    # type: bool
     ):
@@ -443,8 +435,7 @@ def _generation_loop(num_workers,           # type: int
                      train_batch_size,      # type: int
                      eval_batch_size,       # type: int
                      deterministic,         # type: bool
-                     match_mlperf,          # type: bool
-                     io_pool                # type: multiprocessing.Pool
+                     match_mlperf           # type: bool
                     ):
   # type: (...) -> None
   """Primary run loop for data file generation."""
@@ -460,7 +451,7 @@ def _generation_loop(num_workers,           # type: int
       num_workers=multiprocessing.cpu_count(), cache_paths=cache_paths,
       num_readers=num_readers, num_items=num_items,
       training_shards=training_shards, deterministic=deterministic,
-      match_mlperf=match_mlperf, io_pool=io_pool
+      match_mlperf=match_mlperf
   )
 
   # Training blocks on the creation of the first epoch, so the num_workers
@@ -590,23 +581,21 @@ def main(_):
     with mlperf_helper.LOGGER(
         enable=flags.FLAGS.output_ml_perf_compliance_logging):
       mlperf_helper.set_ncf_root(os.path.split(os.path.abspath(__file__))[0])
-      with popen_helper.get_pool(2, init_worker) as io_pool:
-        _generation_loop(
-            num_workers=flags.FLAGS.num_workers,
-            cache_paths=cache_paths,
-            num_readers=flags.FLAGS.num_readers,
-            num_neg=flags.FLAGS.num_neg,
-            num_train_positives=flags.FLAGS.num_train_positives,
-            num_items=flags.FLAGS.num_items,
-            num_users=flags.FLAGS.num_users,
-            epochs_per_cycle=flags.FLAGS.epochs_per_cycle,
-            num_cycles=flags.FLAGS.num_cycles,
-            train_batch_size=flags.FLAGS.train_batch_size,
-            eval_batch_size=flags.FLAGS.eval_batch_size,
-            deterministic=flags.FLAGS.seed is not None,
-            match_mlperf=flags.FLAGS.ml_perf,
-            io_pool=io_pool
-        )
+      _generation_loop(
+          num_workers=flags.FLAGS.num_workers,
+          cache_paths=cache_paths,
+          num_readers=flags.FLAGS.num_readers,
+          num_neg=flags.FLAGS.num_neg,
+          num_train_positives=flags.FLAGS.num_train_positives,
+          num_items=flags.FLAGS.num_items,
+          num_users=flags.FLAGS.num_users,
+          epochs_per_cycle=flags.FLAGS.epochs_per_cycle,
+          num_cycles=flags.FLAGS.num_cycles,
+          train_batch_size=flags.FLAGS.train_batch_size,
+          eval_batch_size=flags.FLAGS.eval_batch_size,
+          deterministic=flags.FLAGS.seed is not None,
+          match_mlperf=flags.FLAGS.ml_perf
+      )
   except KeyboardInterrupt:
     log_msg("KeyboardInterrupt registered.")
   except:
