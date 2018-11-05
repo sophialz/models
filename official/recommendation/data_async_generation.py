@@ -419,7 +419,8 @@ def _construct_records(
       items_by_user = data[1].reshape(-1, num_neg + 1)
       shard_indices = np.linspace(0, items_by_user.shape[0], num_workers + 1).astype("int")
       sharded_items = [items_by_user[shard_indices[i]:shard_indices[i+1], :] for i in range(num_workers)]
-      dupe_generator = pool.imap(stat_utils.mask_duplicates, [(sharded_items[i], 1) for i in range(num_workers)])
+      dupe_generator = pool.starmap(stat_utils.mask_duplicates, [(sharded_items[i], 1) for i in range(num_workers)])
+
       dupe_mask = np.concatenate([i.flatten().astype(np.int8) for i in dupe_generator])
 
   log_msg("Data generation complete. (time: {:.1f} seconds) Beginning async I/O"
