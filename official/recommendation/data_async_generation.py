@@ -325,9 +325,11 @@ def _construct_records(
     epochs_per_cycle,     # type: int
     batch_size,           # type: int
     training_shards,      # type: typing.List[str]
+    queue_value,
+    queue_lock,
     deterministic=False,  # type: bool
     match_mlperf=False,   # type: bool
-    seed=None
+    seed=None,
     ):
   """Generate false negatives and write TFRecords files.
 
@@ -351,19 +353,33 @@ def _construct_records(
     training_shards: The picked positive examples from which to generate
       negatives.
   """
-  st = timeit.default_timer()
+  if is_training and train_cycle == 0:
+    worker_ind = 0
+  elif not is_training:
+    worker_ind = 1
+  else:
+    worker_ind = train_cycle + 1
 
-  if seed is not None:
-    np.random.seed(seed)
+  # Wait to enter heavyweight pool
+  while True:
+    with queue_lock:
+      current_queue_value = queue_value.get()
+
+    if current_queue_value >= worker_ind:
+      break
+
+    time.sleep(0.1)
+
+  st = timeit.default_timer()
 
   if is_training:
     mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_STEP_TRAIN_NEG_GEN)
     mlperf_helper.ncf_print(
-        key=mlperf_helper.TAGS.INPUT_HP_NUM_NEG, value=num_neg)
+      key=mlperf_helper.TAGS.INPUT_HP_NUM_NEG, value=num_neg)
 
     # set inside _process_shard()
     mlperf_helper.ncf_print(
-        key=mlperf_helper.TAGS.INPUT_HP_SAMPLE_TRAIN_REPLACEMENT, value=True)
+      key=mlperf_helper.TAGS.INPUT_HP_SAMPLE_TRAIN_REPLACEMENT, value=True)
 
   else:
     # Later logic assumes that all items for a given user are in the same batch.
@@ -374,6 +390,9 @@ def _construct_records(
 
     mlperf_helper.ncf_print(key=mlperf_helper.TAGS.EVAL_HP_NUM_USERS,
                             value=num_positives)
+
+  if seed is not None:
+    np.random.seed(seed)
 
   assert epochs_per_cycle == 1 or is_training
   num_workers = min([num_workers, len(training_shards) * epochs_per_cycle])
@@ -422,6 +441,13 @@ def _construct_records(
 
     assert np.sum(data[0] == -1) == num_padding
 
+    # Close the pool and signal to the next process in line to begin its pool.
+    if is_training:
+      pool.close()
+      pool.terminate()
+      with queue_lock:
+        queue_value.value += 1
+
     log_msg("Shuffling data...")
     if is_training:
       if num_padding:
@@ -453,6 +479,12 @@ def _construct_records(
       dupe_generator = pool.starmap(stat_utils.mask_duplicates, [(sharded_items[i], 1) for i in range(num_workers)])
 
       dupe_mask = np.concatenate([i.astype(np.int8) for i in dupe_generator]).flatten()
+
+      # The eval process has to hang onto its pool to compute the dupe mask.
+      pool.close()
+      pool.terminate()
+      with queue_lock:
+        queue_value.value += 1
 
   log_msg("Data generation complete. (time: {:.1f} seconds) Beginning file write."
           .format(timeit.default_timer() - st))
@@ -486,11 +518,14 @@ def _generation_loop(num_workers,           # type: int
   training_shards = [os.path.join(cache_paths.train_shard_subdir, i) for i in
                      tf.gfile.ListDirectory(cache_paths.train_shard_subdir)]
 
+  manager = multiprocessing.Manager()
+  queue_value = manager.Value(int, value=0)
+  queue_lock = manager.Lock()
   shared_kwargs = dict(
       num_workers=multiprocessing.cpu_count(), cache_paths=cache_paths,
       num_readers=num_readers, num_items=num_items,
       training_shards=training_shards, deterministic=deterministic,
-      match_mlperf=match_mlperf
+      match_mlperf=match_mlperf, queue_value=queue_value, queue_lock=queue_lock
   )
 
   gen_procs = deque()
@@ -505,8 +540,6 @@ def _generation_loop(num_workers,           # type: int
         num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
         batch_size=train_batch_size, seed=stat_utils.random_int32(), **shared_kwargs
     )))
-
-    time.sleep(5)  # let first process get going.
 
     # Construct evaluation set.
     shared_kwargs["num_workers"] = num_workers
@@ -547,7 +580,6 @@ def _generation_loop(num_workers,           # type: int
           num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
           batch_size=train_batch_size, seed=stat_utils.random_int32(), **shared_kwargs
       )))
-      time.sleep(10)
 
       wait_count = 0
       start_time = time.time()
