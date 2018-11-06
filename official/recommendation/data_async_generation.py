@@ -537,7 +537,7 @@ def _generation_loop(num_workers,           # type: int
         continue
 
       proc_0.wait()
-      proc_1 = proc_0
+      proc_0 = proc_1
 
       train_cycle += 1
       proc_1 = high_level_pool.apply_async(func=dict(
