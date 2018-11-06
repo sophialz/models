@@ -23,6 +23,7 @@ import contextlib
 import datetime
 import gc
 import multiprocessing
+import multiprocessing.pool
 import json
 import os
 import pickle
@@ -51,6 +52,18 @@ from official.utils.logs import mlperf_helper
 
 _log_file = None
 
+
+# https://stackoverflow.com/questions/6974695/python-process-pool-non-daemonic
+class NoDaemonProcess(multiprocessing.Process):
+  # make 'daemon' attribute always return False
+  def _get_daemon(self):
+    return False
+  def _set_daemon(self, value):
+    pass
+  daemon = property(_get_daemon, _set_daemon)
+
+class NoDaemonPool(multiprocessing.pool.Pool):
+  Process = NoDaemonProcess
 
 def log_msg(msg):
   """Include timestamp info when logging messages to a file."""
@@ -189,7 +202,7 @@ def init_worker():
 def write_record_files(
     is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers,
     cache_paths, train_cycle, st, dupe_mask):
-  log("Beginning shard write function...")
+  log_msg("Beginning shard write function...")
   if is_training:
     # The number of points is slightly larger than num_pts due to padding.
     mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_SIZE,
@@ -372,76 +385,73 @@ def _construct_records(
       for i, shard in enumerate(training_shards * epochs_per_cycle)]
 
   log_msg("Entering pool...")
+  with popen_helper.get_pool(num_workers, init_worker) as pool:
+    map_fn = pool.imap if deterministic else pool.imap_unordered  # pylint: disable=no-member
+    data_generator = map_fn(_process_shard, map_args)
+    data = [
+        np.zeros(shape=(num_pts_with_padding,), dtype=np.int32) - 1,
+        np.zeros(shape=(num_pts_with_padding,), dtype=np.uint16),
+        np.zeros(shape=(num_pts_with_padding,), dtype=np.int8),
+    ]
 
-  map_fn = pool.imap if deterministic else pool.imap_unordered  # pylint: disable=no-member
-  data_generator = map_fn(_process_shard, map_args)
-  data = [
-      np.zeros(shape=(num_pts_with_padding,), dtype=np.int32) - 1,
-      np.zeros(shape=(num_pts_with_padding,), dtype=np.uint16),
-      np.zeros(shape=(num_pts_with_padding,), dtype=np.int8),
-  ]
-
-  # Training data is shuffled. Evaluation data MUST not be shuffled.
-  # Downstream processing depends on the fact that evaluation data for a given
-  # user is grouped within a batch.
-  if is_training:
-    index_destinations = np.random.permutation(num_pts)
-    mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_ORDER)
-  else:
-    index_destinations = np.arange(num_pts)
-
-  start_ind = 0
-  for data_segment in data_generator:
-    n_in_segment = data_segment[0].shape[0]
-    dest = index_destinations[start_ind:start_ind + n_in_segment]
-    start_ind += n_in_segment
-    for i in range(3):
-      data[i][dest] = data_segment[i]
-
-  assert np.sum(data[0] == -1) == num_padding
-
-  log_msg("Shuffling data...")
-  if is_training:
-    if num_padding:
-      # In order to have a full batch, randomly include points from earlier in
-      # the batch.
-
+    # Training data is shuffled. Evaluation data MUST not be shuffled.
+    # Downstream processing depends on the fact that evaluation data for a given
+    # user is grouped within a batch.
+    if is_training:
+      index_destinations = np.random.permutation(num_pts)
       mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_ORDER)
-      pad_sample_indices = np.random.randint(
-          low=0, high=num_pts, size=(num_padding,))
-      dest = np.arange(start=start_ind, stop=start_ind + num_padding)
-      start_ind += num_padding
+    else:
+      index_destinations = np.arange(num_pts)
+
+    start_ind = 0
+    for data_segment in data_generator:
+      n_in_segment = data_segment[0].shape[0]
+      dest = index_destinations[start_ind:start_ind + n_in_segment]
+      start_ind += n_in_segment
       for i in range(3):
-        data[i][dest] = data[i][pad_sample_indices]
-  else:
-    # For Evaluation, padding is all zeros. The evaluation input_fn knows how
-    # to interpret and discard the zero padded entries.
-    data[0][num_pts:] = 0
+        data[i][dest] = data_segment[i]
 
-  # Check that no points were overlooked.
-  assert not np.sum(data[0] == -1)
+    assert np.sum(data[0] == -1) == num_padding
 
-  if is_training:
-    dupe_mask = None
-  else:
-    log_msg("Generating duplicate mask...")
-    items_by_user = data[1].reshape(-1, num_neg + 1)
-    shard_indices = np.linspace(0, items_by_user.shape[0], num_workers + 1).astype("int")
-    sharded_items = [items_by_user[shard_indices[i]:shard_indices[i+1], :] for i in range(num_workers)]
-    dupe_generator = pool.starmap(stat_utils.mask_duplicates, [(sharded_items[i], 1) for i in range(num_workers)])
+    log_msg("Shuffling data...")
+    if is_training:
+      if num_padding:
+        # In order to have a full batch, randomly include points from earlier in
+        # the batch.
 
-    dupe_mask = np.concatenate([i.astype(np.int8) for i in dupe_generator]).flatten()
+        mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_ORDER)
+        pad_sample_indices = np.random.randint(
+            low=0, high=num_pts, size=(num_padding,))
+        dest = np.arange(start=start_ind, stop=start_ind + num_padding)
+        start_ind += num_padding
+        for i in range(3):
+          data[i][dest] = data[i][pad_sample_indices]
+    else:
+      # For Evaluation, padding is all zeros. The evaluation input_fn knows how
+      # to interpret and discard the zero padded entries.
+      data[0][num_pts:] = 0
+
+    # Check that no points were overlooked.
+    assert not np.sum(data[0] == -1)
+
+    if is_training:
+      dupe_mask = None
+    else:
+      log_msg("Generating duplicate mask...")
+      items_by_user = data[1].reshape(-1, num_neg + 1)
+      shard_indices = np.linspace(0, items_by_user.shape[0], num_workers + 1).astype("int")
+      sharded_items = [items_by_user[shard_indices[i]:shard_indices[i+1], :] for i in range(num_workers)]
+      dupe_generator = pool.starmap(stat_utils.mask_duplicates, [(sharded_items[i], 1) for i in range(num_workers)])
+
+      dupe_mask = np.concatenate([i.astype(np.int8) for i in dupe_generator]).flatten()
 
   log_msg("Data generation complete. (time: {:.1f} seconds) Beginning file write."
           .format(timeit.default_timer() - st))
 
-  pool.apply_async(func=write_record_files, args=(
-    is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers,
-    cache_paths, train_cycle, st, dupe_mask))
+  write_record_files(
+      is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers,
+      cache_paths, train_cycle, st, dupe_mask)
 
-  # write_record_files(
-  #     is_training, data, batch_size, num_pts, num_pts_with_padding, num_readers,
-  #     cache_paths, train_cycle, st, dupe_mask)
 
 def _generation_loop(num_workers,           # type: int
                      cache_paths,           # type: rconst.Paths
@@ -455,8 +465,7 @@ def _generation_loop(num_workers,           # type: int
                      train_batch_size,      # type: int
                      eval_batch_size,       # type: int
                      deterministic,         # type: bool
-                     match_mlperf,          # type: bool
-                     pool                   # type: multiprocessing.Pool
+                     match_mlperf           # type: bool
                     ):
   # type: (...) -> None
   """Primary run loop for data file generation."""
@@ -472,54 +481,77 @@ def _generation_loop(num_workers,           # type: int
       num_workers=multiprocessing.cpu_count(), cache_paths=cache_paths,
       num_readers=num_readers, num_items=num_items,
       training_shards=training_shards, deterministic=deterministic,
-      match_mlperf=match_mlperf, pool=pool
+      match_mlperf=match_mlperf
   )
 
-  # Training blocks on the creation of the first epoch, so the num_workers
-  # limit is not respected for this invocation
-  train_cycle = 0
-  _construct_records(
-      is_training=True, train_cycle=train_cycle, num_neg=num_neg,
-      num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
-      batch_size=train_batch_size, **shared_kwargs)
+  with NoDaemonPool(2) as high_level_pool:
+    # Training blocks on the creation of the first epoch, so the num_workers
+    # limit is not respected for this invocation
+    train_cycle = 0
 
-  # Construct evaluation set.
-  shared_kwargs["num_workers"] = num_workers
-  _construct_records(
-      is_training=False, train_cycle=None, num_neg=rconst.NUM_EVAL_NEGATIVES,
-      num_positives=num_users, epochs_per_cycle=1, batch_size=eval_batch_size,
-      **shared_kwargs)
-
-  wait_count = 0
-  start_time = time.time()
-
-  while train_cycle < num_cycles:
-    ready_epochs = tf.gfile.ListDirectory(cache_paths.train_epoch_dir)
-    if len(ready_epochs) >= rconst.CYCLES_TO_BUFFER:
-      wait_count += 1
-      sleep_time = max([0, wait_count * 5 - (time.time() - start_time)])
-      time.sleep(sleep_time)
-
-      if (wait_count % 10) == 0:
-        log_msg("Waited {} times for data to be consumed."
-                .format(wait_count))
-
-      if time.time() - start_time > rconst.TIMEOUT_SECONDS:
-        log_msg("Waited more than {} seconds. Concluding that this "
-                "process is orphaned and exiting gracefully."
-                .format(rconst.TIMEOUT_SECONDS))
-        sys.exit()
-
-      continue
-
-    train_cycle += 1
-    _construct_records(
+    proc_0 = high_level_pool.apply_async(func=_construct_record, kwds=dict(
         is_training=True, train_cycle=train_cycle, num_neg=num_neg,
         num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
-        batch_size=train_batch_size, **shared_kwargs)
+        batch_size=train_batch_size, **shared_kwargs
+    ))
+    # _construct_records(
+    #     is_training=True, train_cycle=train_cycle, num_neg=num_neg,
+    #     num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
+    #     batch_size=train_batch_size, **shared_kwargs)
+
+    time.sleep(10)  # let first process get going.
+
+    # Construct evaluation set.
+    shared_kwargs["num_workers"] = num_workers
+    proc_1 = high_level_pool.apply_async(func=_construct_record, kwds=dict(
+        is_training=False, train_cycle=None, num_neg=rconst.NUM_EVAL_NEGATIVES,
+        num_positives=num_users, epochs_per_cycle=1, batch_size=eval_batch_size,
+        **shared_kwargs
+    ))
+
+    # _construct_records(
+    #     is_training=False, train_cycle=None, num_neg=rconst.NUM_EVAL_NEGATIVES,
+    #     num_positives=num_users, epochs_per_cycle=1, batch_size=eval_batch_size,
+    #     **shared_kwargs)
 
     wait_count = 0
     start_time = time.time()
+
+    while train_cycle < num_cycles:
+      ready_epochs = tf.gfile.ListDirectory(cache_paths.train_epoch_dir)
+      if len(ready_epochs) >= rconst.CYCLES_TO_BUFFER:
+        wait_count += 1
+        sleep_time = max([0, wait_count * 5 - (time.time() - start_time)])
+        time.sleep(sleep_time)
+
+        if (wait_count % 10) == 0:
+          log_msg("Waited {} times for data to be consumed."
+                  .format(wait_count))
+
+        if time.time() - start_time > rconst.TIMEOUT_SECONDS:
+          log_msg("Waited more than {} seconds. Concluding that this "
+                  "process is orphaned and exiting gracefully."
+                  .format(rconst.TIMEOUT_SECONDS))
+          sys.exit()
+
+        continue
+
+      proc_0.wait()
+      proc_1 = proc_0
+
+      train_cycle += 1
+      proc_1 = high_level_pool.apply_async(func=dict(
+          is_training=True, train_cycle=train_cycle, num_neg=num_neg,
+          num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
+          batch_size=train_batch_size, **shared_kwargs
+      ))
+      # _construct_records(
+      #     is_training=True, train_cycle=train_cycle, num_neg=num_neg,
+      #     num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
+      #     batch_size=train_batch_size, **shared_kwargs)
+
+      wait_count = 0
+      start_time = time.time()
     gc.collect()
 
 
@@ -602,23 +634,21 @@ def main(_):
     with mlperf_helper.LOGGER(
         enable=flags.FLAGS.output_ml_perf_compliance_logging):
       mlperf_helper.set_ncf_root(os.path.split(os.path.abspath(__file__))[0])
-      with popen_helper.get_pool(num_workers, init_worker) as pool:
-        _generation_loop(
-            num_workers=flags.FLAGS.num_workers,
-            cache_paths=cache_paths,
-            num_readers=flags.FLAGS.num_readers,
-            num_neg=flags.FLAGS.num_neg,
-            num_train_positives=flags.FLAGS.num_train_positives,
-            num_items=flags.FLAGS.num_items,
-            num_users=flags.FLAGS.num_users,
-            epochs_per_cycle=flags.FLAGS.epochs_per_cycle,
-            num_cycles=flags.FLAGS.num_cycles,
-            train_batch_size=flags.FLAGS.train_batch_size,
-            eval_batch_size=flags.FLAGS.eval_batch_size,
-            deterministic=flags.FLAGS.seed is not None,
-            match_mlperf=flags.FLAGS.ml_perf,
-            pool=pool
-        )
+      _generation_loop(
+          num_workers=flags.FLAGS.num_workers,
+          cache_paths=cache_paths,
+          num_readers=flags.FLAGS.num_readers,
+          num_neg=flags.FLAGS.num_neg,
+          num_train_positives=flags.FLAGS.num_train_positives,
+          num_items=flags.FLAGS.num_items,
+          num_users=flags.FLAGS.num_users,
+          epochs_per_cycle=flags.FLAGS.epochs_per_cycle,
+          num_cycles=flags.FLAGS.num_cycles,
+          train_batch_size=flags.FLAGS.train_batch_size,
+          eval_batch_size=flags.FLAGS.eval_batch_size,
+          deterministic=flags.FLAGS.seed is not None,
+          match_mlperf=flags.FLAGS.ml_perf
+      )
   except KeyboardInterrupt:
     log_msg("KeyboardInterrupt registered.")
   except:
