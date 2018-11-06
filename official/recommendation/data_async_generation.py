@@ -551,6 +551,7 @@ def _generation_loop(num_workers,           # type: int
 
       wait_count = 0
       start_time = time.time()
+    [i.wait() for i in gen_procs]
     gc.collect()
 
 
