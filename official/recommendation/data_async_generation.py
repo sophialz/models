@@ -29,6 +29,7 @@ import json
 import os
 import pickle
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -281,8 +282,12 @@ def write_record_files(
         writer.write(batch_bytes)
 
   if temp_dir:
-    for i in tf.gfile.ListDirectory(temp_dir):
-      tf.gfile.Copy(os.path.join(temp_dir, i), os.path.join(record_dir, i))
+    # for i in tf.gfile.ListDirectory(temp_dir):
+    #   tf.gfile.Copy(os.path.join(temp_dir, i), os.path.join(record_dir, i))
+
+    # Lean on subprocess
+    subprocess.call(["gsutil", "-m", "cp", "-r", temp_dir + "/*", record_dir + "/"])
+
     tf.gfile.DeleteRecursively(temp_dir)
 
   batch_count = sum([len(i) for i in batches_by_file])
@@ -321,7 +326,8 @@ def _construct_records(
     batch_size,           # type: int
     training_shards,      # type: typing.List[str]
     deterministic=False,  # type: bool
-    match_mlperf=False    # type: bool
+    match_mlperf=False,   # type: bool
+    seed=None
     ):
   """Generate false negatives and write TFRecords files.
 
@@ -346,6 +352,9 @@ def _construct_records(
       negatives.
   """
   st = timeit.default_timer()
+
+  if seed is not None:
+    np.random.seed(seed)
 
   if is_training:
     mlperf_helper.ncf_print(key=mlperf_helper.TAGS.INPUT_STEP_TRAIN_NEG_GEN)
@@ -494,7 +503,7 @@ def _generation_loop(num_workers,           # type: int
     gen_procs.append(high_level_pool.apply_async(func=_construct_records, kwds=dict(
         is_training=True, train_cycle=train_cycle, num_neg=num_neg,
         num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
-        batch_size=train_batch_size, **shared_kwargs
+        batch_size=train_batch_size, seed=stat_utils.random_int32(), **shared_kwargs
     )))
 
     time.sleep(5)  # let first process get going.
@@ -504,7 +513,7 @@ def _generation_loop(num_workers,           # type: int
     gen_procs.append(high_level_pool.apply_async(func=_construct_records, kwds=dict(
         is_training=False, train_cycle=None, num_neg=rconst.NUM_EVAL_NEGATIVES,
         num_positives=num_users, epochs_per_cycle=1, batch_size=eval_batch_size,
-        **shared_kwargs
+        seed=stat_utils.random_int32(), **shared_kwargs
     )))
 
     wait_count = 0
@@ -536,12 +545,9 @@ def _generation_loop(num_workers,           # type: int
       gen_procs.append(high_level_pool.apply_async(func=_construct_records, kwds=dict(
           is_training=True, train_cycle=train_cycle, num_neg=num_neg,
           num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
-          batch_size=train_batch_size, **shared_kwargs
+          batch_size=train_batch_size, seed=stat_utils.random_int32(), **shared_kwargs
       )))
-      # _construct_records(
-      #     is_training=True, train_cycle=train_cycle, num_neg=num_neg,
-      #     num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
-      #     batch_size=train_batch_size, **shared_kwargs)
+      time.sleep(10)
 
       wait_count = 0
       start_time = time.time()
