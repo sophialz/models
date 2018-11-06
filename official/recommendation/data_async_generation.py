@@ -19,6 +19,7 @@ from __future__ import division
 from __future__ import print_function
 
 import atexit
+from collections import deque
 import contextlib
 import datetime
 import gc
@@ -319,7 +320,6 @@ def _construct_records(
     epochs_per_cycle,     # type: int
     batch_size,           # type: int
     training_shards,      # type: typing.List[str]
-    pool,                 # type: multiprocessing.Pool
     deterministic=False,  # type: bool
     match_mlperf=False    # type: bool
     ):
@@ -484,35 +484,28 @@ def _generation_loop(num_workers,           # type: int
       match_mlperf=match_mlperf
   )
 
-  with NoDaemonPool(2) as high_level_pool:
+  gen_procs = deque()
+  assert rconst.PARALLEL_GEN_EPOCHS >= 2
+  with NoDaemonPool(rconst.PARALLEL_GEN_EPOCHS) as high_level_pool:
     # Training blocks on the creation of the first epoch, so the num_workers
     # limit is not respected for this invocation
     train_cycle = 0
 
-    proc_0 = high_level_pool.apply_async(func=_construct_record, kwds=dict(
+    gen_procs.append(high_level_pool.apply_async(func=_construct_records, kwds=dict(
         is_training=True, train_cycle=train_cycle, num_neg=num_neg,
         num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
         batch_size=train_batch_size, **shared_kwargs
-    ))
-    # _construct_records(
-    #     is_training=True, train_cycle=train_cycle, num_neg=num_neg,
-    #     num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
-    #     batch_size=train_batch_size, **shared_kwargs)
+    )))
 
-    time.sleep(10)  # let first process get going.
+    time.sleep(5)  # let first process get going.
 
     # Construct evaluation set.
     shared_kwargs["num_workers"] = num_workers
-    proc_1 = high_level_pool.apply_async(func=_construct_record, kwds=dict(
+    gen_procs.append(high_level_pool.apply_async(func=_construct_records, kwds=dict(
         is_training=False, train_cycle=None, num_neg=rconst.NUM_EVAL_NEGATIVES,
         num_positives=num_users, epochs_per_cycle=1, batch_size=eval_batch_size,
         **shared_kwargs
-    ))
-
-    # _construct_records(
-    #     is_training=False, train_cycle=None, num_neg=rconst.NUM_EVAL_NEGATIVES,
-    #     num_positives=num_users, epochs_per_cycle=1, batch_size=eval_batch_size,
-    #     **shared_kwargs)
+    )))
 
     wait_count = 0
     start_time = time.time()
@@ -536,15 +529,15 @@ def _generation_loop(num_workers,           # type: int
 
         continue
 
-      proc_0.wait()
-      proc_0 = proc_1
+      if len(gen_procs) >= rconst.PARALLEL_GEN_EPOCHS:
+        gen_procs.popleft().wait()
 
       train_cycle += 1
-      proc_1 = high_level_pool.apply_async(func=dict(
+      gen_procs.append(high_level_pool.apply_async(func=_construct_records, kwds=dict(
           is_training=True, train_cycle=train_cycle, num_neg=num_neg,
           num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
           batch_size=train_batch_size, **shared_kwargs
-      ))
+      )))
       # _construct_records(
       #     is_training=True, train_cycle=train_cycle, num_neg=num_neg,
       #     num_positives=num_train_positives, epochs_per_cycle=epochs_per_cycle,
